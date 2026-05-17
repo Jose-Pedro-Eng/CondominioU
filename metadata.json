@@ -1,0 +1,6 @@
+{
+  "name": "UniLog - Gestão de Condomínio Universitário",
+  "description": "Sistema completo para gestão de residências universitárias, incluindo controle de ocupação, pagamentos, comunicação interna e relatórios automatizados.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
