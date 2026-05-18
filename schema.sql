@@ -3,7 +3,7 @@
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   full_name TEXT NOT NULL,
-  role TEXT CHECK(role IN ('admin', 'student')) NOT NULL,
+  role TEXT CHECK(role IN ('admin', 'student', 'registrar', 'finance')) NOT NULL,
   email TEXT UNIQUE NOT NULL,
   phone TEXT,
   password_hash TEXT NOT NULL,

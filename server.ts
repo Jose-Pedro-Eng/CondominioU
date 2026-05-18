@@ -15,41 +15,123 @@ const JWT_SECRET = process.env.JWT_SECRET || "unilog-default-secret";
 
 // Initialize Database
 const db = new Database(DB_PATH);
+
+// 1. Run basic schema first so tables exist
 const schema = fs.readFileSync("schema.sql", "utf8");
-db.exec(schema);
+try {
+  db.exec(schema);
+  console.log("Database schema initialized.");
+} catch (e) {
+  console.error("Critical error: Schema execution failed:", e);
+}
+
+// 2. Migration: Update roles check constraint if necessary
+try {
+  const tableInfo = db.prepare("PRAGMA table_info(users)").all();
+  if (tableInfo.length > 0) {
+    // Check if the current table supports the new roles by inspecting the SQL
+    const userTableData = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get() as any;
+    const currentSql = userTableData?.sql || "";
+    
+    if (!currentSql.includes("'registrar'") || !currentSql.includes("'finance'")) {
+      console.log("Migrating users table for new roles (Registrar/Finance)...");
+      try {
+        db.exec("PRAGMA foreign_keys = OFF;");
+        db.transaction(() => {
+          // Backup data, drop old, create new, restore data
+          db.exec(`
+            CREATE TABLE users_new (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              full_name TEXT NOT NULL,
+              role TEXT CHECK(role IN ('admin', 'student', 'registrar', 'finance')) NOT NULL,
+              email TEXT UNIQUE NOT NULL,
+              phone TEXT,
+              password_hash TEXT NOT NULL,
+              course TEXT,
+              year INTEGER,
+              location TEXT,
+              status TEXT CHECK(status IN ('active', 'inactive')) DEFAULT 'active',
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO users_new (id, full_name, role, email, phone, password_hash, course, year, location, status, created_at)
+            SELECT id, full_name, role, email, phone, password_hash, course, year, location, status, created_at FROM users;
+            DROP TABLE users;
+            ALTER TABLE users_new RENAME TO users;
+          `);
+        })();
+        db.exec("PRAGMA foreign_keys = ON;");
+        console.log("Migration successful.");
+      } catch (err) {
+        console.error("Migration failed:", err);
+      }
+    }
+  }
+} catch (e) {
+  console.log("Migration check failed:", e);
+}
 
 // Seed basic data (Blocks, Houses, Rooms) if empty
 const seedData = () => {
-  const result = db.prepare("SELECT count(*) as count FROM blocks").get() as { count: number };
-  const blockCount = result?.count || 0;
+  const blockCountResult = db.prepare("SELECT count(*) as count FROM blocks").get() as any;
+  const blockCount = blockCountResult?.count || 0;
+  
   if (blockCount === 0) {
-    console.log("Seeding initial data...");
+    console.log("Seeding architectural data...");
     
-    // Create Blocks
-    const insertBlock = db.prepare("INSERT INTO blocks (name, gender) VALUES (?, ?)");
-    const blockA = insertBlock.run("A", "male").lastInsertRowid;
-    const blockB = insertBlock.run("B", "female").lastInsertRowid;
+    db.transaction(() => {
+      // Create Blocks
+      const insertBlock = db.prepare("INSERT INTO blocks (name, gender) VALUES (?, ?)");
+      const blockA = insertBlock.run("A", "male").lastInsertRowid;
+      const blockB = insertBlock.run("B", "female").lastInsertRowid;
 
-    const insertHouse = db.prepare("INSERT INTO houses (block_id, number) VALUES (?, ?)");
-    const insertRoom = db.prepare("INSERT INTO rooms (house_id, number) VALUES (?, ?)");
+      const insertHouse = db.prepare("INSERT INTO houses (block_id, number) VALUES (?, ?)");
+      const insertRoom = db.prepare("INSERT INTO rooms (house_id, number) VALUES (?, ?)");
 
-    // Create 10 houses per block, 2 rooms per house
-    [blockA, blockB].forEach((blockId, bIdx) => {
-      for (let h = 1; h <= 10; h++) {
-        const houseId = insertHouse.run(blockId, h).lastInsertRowid;
-        for (let r = 1; r <= 2; r++) {
-          insertRoom.run(houseId, r);
+      // Create 10 houses per block, 2 rooms per house
+      [blockA, blockB].forEach((blockId) => {
+        for (let h = 1; h <= 10; h++) {
+          const houseId = insertHouse.run(blockId, h).lastInsertRowid;
+          for (let r = 1; r <= 2; r++) {
+            insertRoom.run(houseId, r);
+          }
         }
+      });
+    })();
+  }
+
+  // Ensure Admin and specialized accounts exist
+  const admins = [
+    { name: "Admin UniLog", role: "admin", email: "admin@unilog.com" },
+    { name: "Registro Staff", role: "registrar", email: "registro@unilog.com" },
+    { name: "Financeiro Staff", role: "finance", email: "financeiro@unilog.com" }
+  ];
+
+  const hashedPW = bcrypt.hashSync("admin123", 10);
+  
+  const checkUser = db.prepare("SELECT id FROM users WHERE email = ?");
+  const insertUser = db.prepare(`
+    INSERT INTO users (full_name, role, email, password_hash, status) 
+    VALUES (?, ?, ?, ?, 'active')
+  `);
+  const updateUser = db.prepare(`
+    UPDATE users SET role = ?, password_hash = ?, status = 'active' WHERE email = ?
+  `);
+
+  db.transaction(() => {
+    admins.forEach(admin => {
+      const existing: any = checkUser.get(admin.email);
+      if (existing) {
+        console.log(`Updating existing staff: ${admin.email}`);
+        updateUser.run(admin.role, hashedPW, admin.email);
+      } else {
+        console.log(`Inserting new staff: ${admin.email}`);
+        insertUser.run(admin.name, admin.role, admin.email, hashedPW);
       }
     });
-
-    // Create a default admin user
-    const hashedPW = bcrypt.hashSync("admin123", 10);
-    db.prepare("INSERT INTO users (full_name, role, email, password_hash, status) VALUES (?, ?, ?, ?, ?)")
-      .run("Admin UniLog", "admin", "admin@unilog.com", hashedPW, "active");
-      
-    console.log("Seeding complete.");
-  }
+  })();
+  
+  const currentStaff = db.prepare("SELECT email, role FROM users WHERE role IN ('admin', 'registrar', 'finance')").all();
+  console.log("Seeded system accounts:", JSON.stringify(currentStaff));
 };
 seedData();
 
@@ -73,16 +155,31 @@ const authenticateToken = (req: any, res: any, next: any) => {
 
 // Auth
 app.post("/api/auth/login", (req, res) => {
-  const { email, password } = req.body;
-  const user: any = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
-  
-  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-    return res.status(401).json({ message: "Credenciais inválidas" });
-  }
+  try {
+    const { email, password } = req.body;
+    console.log(`Login attempt for: ${email}`);
+    
+    const user: any = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+    
+    if (!user) {
+      console.log(`User not found: ${email}`);
+      return res.status(401).json({ message: "Credenciais inválidas" });
+    }
 
-  const token = jwt.sign({ id: user.id, role: user.role, name: user.full_name }, JWT_SECRET, { expiresIn: '24h' });
-  res.cookie('token', token, { httpOnly: true });
-  res.json({ token, user: { id: user.id, role: user.role, name: user.full_name } });
+    if (!bcrypt.compareSync(password, user.password_hash)) {
+      console.log(`Invalid password for: ${email}`);
+      return res.status(401).json({ message: "Credenciais inválidas" });
+    }
+
+    const token = jwt.sign({ id: user.id, role: user.role, name: user.full_name }, JWT_SECRET, { expiresIn: '24h' });
+    res.cookie('token', token, { httpOnly: true, sameSite: 'lax' });
+    
+    console.log(`Login success: ${email} (${user.role})`);
+    res.json({ token, user: { id: user.id, role: user.role, name: user.full_name } });
+  } catch (err: any) {
+    console.error("Login error:", err);
+    res.status(500).json({ message: "Erro interno no servidor" });
+  }
 });
 
 app.post("/api/auth/logout", (req, res) => {
@@ -92,24 +189,169 @@ app.post("/api/auth/logout", (req, res) => {
 
 // Students
 app.get("/api/students", authenticateToken, (req: any, res) => {
-  const students = db.prepare("SELECT * FROM users WHERE role = 'student'").all();
+  const { status } = req.query;
+  const roleFilter = "u.role = 'student'";
+  
+  let query = `
+    SELECT 
+      u.*,
+      (b.name || h.number || '-Q' || r.number) as room_location
+    FROM users u
+    LEFT JOIN occupancy o ON u.id = o.student_id AND o.end_date IS NULL
+    LEFT JOIN rooms r ON o.room_id = r.id
+    LEFT JOIN houses h ON r.house_id = h.id
+    LEFT JOIN blocks b ON h.block_id = b.id
+    WHERE ${roleFilter}
+  `;
+  if (status) query += ` AND u.status = '${status}'`;
+  const students = db.prepare(query).all();
   res.json(students);
 });
 
-app.post("/api/students", authenticateToken, (req: any, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ message: "Only admins can register students" });
+// Managers Management (Admin only)
+app.get("/api/managers", authenticateToken, (req: any, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: "Acesso restrito ao administrador mestre" });
   
-  const { full_name, email, phone, course, year, location, password } = req.body;
-  const hashedPW = bcrypt.hashSync(password || "student123", 10);
+  const managers = db.prepare("SELECT id, full_name, role, email, phone, status, created_at FROM users WHERE role IN ('registrar', 'finance')").all();
+  res.json(managers);
+});
+
+app.post("/api/managers", authenticateToken, (req: any, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: "Acesso restrito ao administrador mestre" });
   
+  const { full_name, email, phone, role, password } = req.body;
+  if (!['registrar', 'finance'].includes(role)) {
+    return res.status(400).json({ message: "Cargo inválido. Use 'registrar' ou 'finance'." });
+  }
+  
+  const hashedPW = bcrypt.hashSync(password || "staff123", 10);
+
   try {
     const result = db.prepare(
-      "INSERT INTO users (full_name, email, phone, course, year, location, role, password_hash) VALUES (?, ?, ?, ?, ?, ?, 'student', ?)"
-    ).run(full_name, email, phone, course, year, location, hashedPW);
+      "INSERT INTO users (full_name, email, phone, role, password_hash) VALUES (?, ?, ?, ?, ?)"
+    ).run(full_name, email, phone, role, hashedPW);
     res.json({ id: result.lastInsertRowid });
   } catch (err: any) {
     res.status(400).json({ message: err.message });
   }
+});
+
+app.put("/api/managers/:id", authenticateToken, (req: any, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: "Acesso restrito ao administrador mestre" });
+  const { full_name, email, phone, role, status, password } = req.body;
+  
+  try {
+    if (password) {
+      const hashedPW = bcrypt.hashSync(password, 10);
+      db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(hashedPW, req.params.id);
+    }
+    
+    db.prepare(
+      "UPDATE users SET full_name = ?, email = ?, phone = ?, role = ?, status = ? WHERE id = ?"
+    ).run(full_name, email, phone, role, status || 'active', req.params.id);
+
+    res.json({ message: "Gestor atualizado" });
+  } catch (err: any) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+app.delete("/api/managers/:id", authenticateToken, (req: any, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: "Acesso restrito ao administrador mestre" });
+  
+  try {
+    db.prepare("DELETE FROM users WHERE id = ? AND role IN ('registrar', 'finance')").run(req.params.id);
+    res.json({ message: "Gestor removido" });
+  } catch (err: any) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+app.post("/api/students", authenticateToken, (req: any, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'registrar') return res.status(403).json({ message: "Apenas registrados ou admin" });
+  
+  const { full_name, email, phone, course, year, room_id, password, role } = req.body;
+  const hashedPW = bcrypt.hashSync(password || "student123", 10);
+  
+  const targetRole = (req.user.role === 'admin' && role) ? role : 'student';
+
+  try {
+    const insertUser = db.prepare(
+      "INSERT INTO users (full_name, email, phone, course, year, role, password_hash) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    );
+    const result = insertUser.run(full_name, email, phone, course, year, targetRole, hashedPW);
+    const studentId = result.lastInsertRowid;
+
+    if (room_id) {
+       db.prepare("INSERT INTO occupancy (student_id, room_id, start_date) VALUES (?, ?, ?)")
+         .run(studentId, room_id, new Date().toISOString().split('T')[0]);
+    }
+
+    res.json({ id: studentId });
+  } catch (err: any) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+app.put("/api/students/:id", authenticateToken, (req: any, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'registrar') return res.status(403).json({ message: "Apenas registrados ou admin" });
+  const { full_name, email, phone, course, year, status, password, room_id, role } = req.body;
+  
+  try {
+    if (password) {
+      const hashedPW = bcrypt.hashSync(password, 10);
+      db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(hashedPW, req.params.id);
+    }
+
+    const targetRoleClause = (req.user.role === 'admin' && role) ? ", role = ?" : "";
+    const params = [full_name, email, phone, course, year, status || 'active'];
+    if (req.user.role === 'admin' && role) params.push(role);
+    params.push(req.params.id);
+
+    db.prepare(
+      `UPDATE users SET full_name = ?, email = ?, phone = ?, course = ?, year = ?, status = ? ${targetRoleClause} WHERE id = ?`
+    ).run(...params);
+
+    if (room_id) {
+       db.prepare("UPDATE occupancy SET end_date = ? WHERE student_id = ? AND end_date IS NULL")
+         .run(new Date().toISOString().split('T')[0], req.params.id);
+       db.prepare("INSERT INTO occupancy (student_id, room_id, start_date) VALUES (?, ?, ?)")
+         .run(req.params.id, room_id, new Date().toISOString().split('T')[0]);
+    }
+
+    res.json({ message: "Atualizado com sucesso" });
+  } catch (err: any) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+// Occupancy History
+app.get("/api/rooms/:id/history", authenticateToken, (req: any, res) => {
+  const history = db.prepare(`
+    SELECT o.*, u.full_name as student_name 
+    FROM occupancy o 
+    JOIN users u ON o.student_id = u.id 
+    WHERE o.room_id = ? 
+    ORDER BY o.start_date DESC
+  `).all(req.params.id);
+  res.json(history);
+});
+
+// Financial Summary (Debts)
+app.get("/api/students/debts", authenticateToken, (req: any, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'finance') return res.status(403).json({ message: "Acesso negado" });
+  // Simplificação: Cada mês custa 5000 MT (exemplo)
+  // Verificamos os meses pagos vs meses desde a entrada
+  const students = db.prepare(`
+    SELECT 
+      u.id, u.full_name, u.course,
+      (SELECT COUNT(*) FROM payments p WHERE p.student_id = u.id) as months_paid,
+      (SELECT SUM(amount) FROM payments p WHERE p.student_id = u.id) as total_paid
+    FROM users u 
+    WHERE u.role = 'student' AND u.status = 'active'
+  `).all();
+  
+  res.json(students);
 });
 
 // Occupancy Dashboard
@@ -136,7 +378,11 @@ app.get("/api/dashboard/occupancy", authenticateToken, (req: any, res) => {
 app.get("/api/rooms", authenticateToken, (req: any, res) => {
   const rooms = db.prepare(`
     SELECT r.id, b.name as block, h.number as house, r.number as room, r.capacity,
-           (SELECT COUNT(*) FROM occupancy o WHERE o.room_id = r.id AND o.end_date IS NULL) as occupants
+           (SELECT COUNT(*) FROM occupancy o WHERE o.room_id = r.id AND o.end_date IS NULL) as occupants,
+           (SELECT GROUP_CONCAT(u.full_name, ';') 
+            FROM occupancy o 
+            JOIN users u ON o.student_id = u.id 
+            WHERE o.room_id = r.id AND o.end_date IS NULL) as occupant_names
     FROM rooms r
     JOIN houses h ON r.house_id = h.id
     JOIN blocks b ON h.block_id = b.id
@@ -145,7 +391,7 @@ app.get("/api/rooms", authenticateToken, (req: any, res) => {
 });
 
 app.post("/api/occupancy", authenticateToken, (req: any, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ message: "Admin only" });
+  if (req.user.role !== 'admin' && req.user.role !== 'registrar') return res.status(403).json({ message: "Acesso negado" });
   const { student_id, room_id, start_date } = req.body;
   
   const room: any = db.prepare(`
@@ -183,7 +429,7 @@ app.get("/api/payments", authenticateToken, (req: any, res) => {
 });
 
 app.post("/api/payments", authenticateToken, (req: any, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ message: "Admin only" });
+  if (req.user.role !== 'admin' && req.user.role !== 'finance') return res.status(403).json({ message: "Acesso negado" });
   const { student_id, amount, payment_date, reference_month, method } = req.body;
   
   const result = db.prepare(
@@ -208,6 +454,10 @@ app.get("/api/messages", authenticateToken, (req: any, res) => {
 app.post("/api/messages", authenticateToken, (req: any, res) => {
   const { content, recipient_id, type } = req.body;
   const sender_id = req.user.id;
+  
+  if (type === 'broadcast' && !['admin', 'registrar', 'finance'].includes(req.user.role)) {
+    return res.status(403).json({ message: "Apenas staff pode enviar comunicados gerais" });
+  }
   
   db.prepare("INSERT INTO messages (sender_id, recipient_id, content, type) VALUES (?, ?, ?, ?)")
     .run(sender_id, recipient_id || null, content, type);
